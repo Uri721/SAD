@@ -1,0 +1,351 @@
+import threading
+import time
+
+from datetime import datetime
+
+from system_tool import data_transmission_separator as dts
+from system_tool import update_id_h_cmd as update_id
+from system_tool import game_state_id_b_cmd as game_state_id
+from system_tool import player_action_id_b_cmd as player_action_id
+
+from poker_tool import Deck
+from poker_tool import Card
+from poker_tool import player_state
+
+from server_player import Server_Player
+
+
+class Poker_Table(object):
+
+    def __init__(self, game_id: int, table_id: int, small_blind: int, stake_ratio: int):
+
+        self.limit = 10
+
+        self.game_id = game_id
+        self.table_id = table_id
+
+        self.small_blind = small_blind
+        self.stake_ratio = stake_ratio
+
+        self.deck = Deck()
+        self.community_cards = [None, None, None, None, None]
+
+        self.players = []
+        for _ in range(self.limit):
+            self.players += [None]
+
+        self.game_players = 0
+        self.in_game_players = 0
+
+        self.pot = 0
+        self.highest_bet = 0
+        self.dealer = 0
+        self.target = 0
+
+        self.state = 0
+        self.terminated = False
+
+    def start_game(self):
+
+        threading.Thread(target=self.game_state_control).start()
+        threading.Thread(target=self.players_state_control).start()
+
+    # Game State Management
+
+    def game_state_control(self):
+
+        self.update_state()
+
+        while self.state != game_state_id['terminated']:
+
+            if self.state == game_state_id['pre_flop']:
+
+                self.blinds()
+                self.deck.shuffle()
+                self.deal_cards()
+                self.betting_round()
+                self.update_state()
+
+            elif self.state == game_state_id['flop'] or game_state_id['river'] or game_state_id['turn']:
+
+                self.deal_cards()
+                self.betting_round()
+                self.update_state()
+
+            elif self.state == game_state_id['showdown']:
+
+                self.showdown()
+                self.update_state()
+
+    # Player State Management
+
+    def players_state_control(self):
+
+        while self.state != game_state_id['terminated']:
+
+            for player in self.players:
+                if (player is not None) and (not player.connected):
+                    self.players[self.players.index(player)] = None
+                    self.game_players -= 1
+                time.sleep(1)
+
+    def add_player(self, player: Server_Player):
+
+        if self.game_players < self.limit:
+            self.players[self.players.index(None)] = player
+            self.game_players += 1
+            player.table_position = (self.players.index(player) + 1)
+            return True
+
+        else:
+            return False
+
+    # Game Properties Control Functions
+
+    def blinds(self):
+
+        _ = self.next_player_position(self.dealer)
+
+        self.players[_].update_stack(self.small_blind, False)
+        self.pot += self.small_blind
+
+        _ = self.next_player_position(_)
+
+        self.players[_].update_stack(self.small_blind * 2, False)
+        self.pot += self.small_blind * 2
+
+        self.highest_bet = self.small_blind * 2
+
+        self.update_players_view()
+
+    def deal_cards(self):
+
+        if self.state == game_state_id['pre_flop']:
+
+            self.update_target('cards_deal')
+
+            for _ in range(self.in_game_players):
+                self.players[self.target].update_cards(
+                    self.deck.deal(2))
+                self.update_target('increment')
+
+        elif self.state == game_state_id['flop']:
+            self.deck.deal(1)
+            self.community_cards += self.deck.deal(3)
+
+        elif self.state == game_state_id['river'] or game_state_id['turn']:
+            self.deck.deal(1)
+            self.community_cards += self.deck.deal(1)
+
+        self.update_players_view()
+
+    def betting_round(self):
+
+        last_to_talk = self.dealer
+        self.update_target('round_start')
+
+        while True:
+
+            data = self.players[self.target].decide()
+
+            if data[0] == player_action_id['check']:
+                pass
+
+            elif data[0] == player_action_id['fold']:
+                self.players[self.target].state = player_state['out_game']
+                self.in_game_players -= 1
+
+            elif data[0] == player_action_id['raise']:
+                amount = data[1]
+                self.pot += amount
+                self.players[self.target].update_stack(amount, False)
+                self.highest_bet = self.players[self.target].bet
+                last_to_talk = self.target
+
+            elif data[0] == player_action_id['call']:
+                amount = (self.highest_bet -
+                          self.players[self.target].bet)
+                self.pot += amount
+                self.players[self.target].update_stack(amount, False)
+
+            if self.target == last_to_talk:
+                break
+
+            self.update_target('increment')
+
+        for player in self.players:
+            if player is not None:
+                player.bet = 0
+
+    def showdown(self):
+
+        self.target = -1
+
+        winners = []
+        hand_result = -1
+
+        # CAS ON SHA ARRIBAT AL FINAL DE LA PARTIDA
+        # COMPARAR RANKS, DETERMINAR GUANYADOR I DONARLI POT I POT = 0
+        # POSAR ESTATS JUGADORS A SHOWDOWN
+        if self.in_game_players > 1:
+            pass
+
+        else:
+            for player in self.players:
+                if (player is not None) and (player.state == player_state['in_game']):
+                    player.update_balance(self.pot, True)
+                    self.pot = 0
+                    break
+
+        self.update_players_view()
+        self.update_round_result(hand_result, winners)
+
+        for player in self.players:
+            if (player is not None) and (player.stack == 0):
+                player.send([update_id['game_result'], (self.game_players), 0])
+                self.players[self.players.index(player)] = None
+                self.game_players -= 1
+
+        self.community_cards = [None, None, None, None, None]
+        self.update_players_view()
+
+    # Game Parameters Management
+
+    def update_state(self):
+
+        if self.state == 0:
+            for player in self.players:
+                if player is not None:
+                    player.state = 0
+                    self.in_game_players += 1
+
+        elif self.state == game_state_id['showdown']:
+            if self.game_players < 2:
+                self.terminated = True
+                return
+
+            self.update_dealer()
+            self.state = game_state_id['pre_flop']
+
+            self.in_game_players = 0
+            for player in self.players:
+                if player is not None:
+                    player.state = 0
+                    self.in_game_players += 1
+            return
+
+        elif self.in_game_players < 2:
+            self.state = game_state_id['showdown']
+            return
+
+        else:
+            self.state += 1
+
+        self.update_players_view()
+
+    def update_dealer(self):
+
+        self.dealer = self.next_player_position(self.dealer)
+        self.update_players_view()
+
+    def update_target(self, cmd: str):
+
+        if cmd == 'increment':
+            self.target = self.next_player_position(self.target)
+
+        elif cmd == 'cards_deal':
+            self.target = self.next_player_position(self.dealer)
+
+        elif cmd == 'round_start':
+
+            if self.state == game_state_id['pre_flop']:
+                self.target = self.next_player_position(self.dealer)
+                self.target = self.next_player_position(self.target)
+                self.target = self.next_player_position(self.target)
+
+            else:
+                self.target = self.next_player_position(self.dealer)
+
+        self.update_players_view()
+
+    def next_player_position(self, target: int):
+
+        for _ in range(self.limit):
+            target = ((target + 1) % self.limit)
+            if (self.players[target] is not None) and (self.players[target].state == player_state['in_game']):
+                return target
+
+    # Game View Update
+
+    def update_players_view(self):
+
+        tx_data = [update_id['game_update']]
+        tx_data += [self.pot, self.small_blind, self.highest_bet,
+                    (self.dealer + 1), (self.target + 1)]
+
+        tx_data += dts
+
+        for player in self.players:
+            if player is not None:
+                tx_data += [player.name, player.position, player.bet,
+                            player.stack, player.state, player.cards[0], player.cards[1]]
+
+        tx_data += dts
+
+        for card in self.community_cards:
+            if card is None:
+                tx_data += [-1]
+            else:
+                tx_data = [card.suit + card.rank]
+
+        for player in self.players:
+            if player is not None:
+                player.send(tx_data)
+
+        time.sleep(2.5)
+
+    # Round Result Update
+
+    def update_round_result(self, hand_result: int, winners: []):
+
+        tx_data = [update_id['round_result']]
+        tx_data += [hand_result]
+        tx_data += winners
+
+        for player in self.players:
+            if player is not None:
+                player.send(tx_data)
+
+        time.sleep(5)
+
+# SEND
+
+# GAME VIEW UPDATE [BROADCAST]
+# ID: game_update
+# [‘750’,’50’,’3’,’4’,’$’,’alba’,’3’,’300’,’5000’,’0’,’13’,’314’,’uri’,’4’,’300’,’2500’,’0’,’32’,’310’,’josep’,’1’,’300’,’7000’,’0’,’43’,’110’,’ines’,’8’,’300’,’500’,’0’,’35’,’37’,’$’,’34’,’42’,’414’,’411’,’-1’]
+# ['pot','small blind','highest_bet','dealer_position','target_position','$','player_name','player_position','playert_bet','player_stack','player_state','player_card_1','player_card_2','$','community_card_1','community_card_2','community_card_3','community_card_4','community_card_5',]
+
+# ROUND RESULT UPDATE [BROADCAST]
+# ID: round_result
+# ['willy']
+# ['598','two_pair',''willy','jhonny'] POT HAVER-HI MES D'UN GUANYADOR, LA MA, EL 598, ENVIAMHO UTILITZANT game_rank_id_b_cmd DE SYSTEM TOOL
+# ['winning_hand','player_name'] QUE HA SIGUT LA MA GUANYADORA I QUI HA GUANYAT
+
+# PLAYER GAME RESULT
+# ID: game_result
+# ['3','20000'] POSICIO FINAL A LA PARTIDA I PASTA GUANYADA
+# ['final_result', 'winnings']
+
+# PLAYER DECISION REQUEST
+# ID: player_request
+
+# RECEIVE
+
+# DISCONNECT
+# ID: disconnect
+
+# PLAYER DECISION REPLY
+# ID: player_reply
+# ['511'] (FOLD) ENVIAHO AMB player_action_id_b_cmd DE SYSTEM TOOL
+# ['512','300'] RAISE PORTA DARRERE LA QUANTITAT QUE S'HA APOSTAT
+# ['player_decision']
