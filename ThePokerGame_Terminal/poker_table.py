@@ -319,7 +319,7 @@ class Poker_Table(object):
             self.state == game_state_id['terminated']
             return
 
-        elif self.in_game_players > 2:
+        elif self.in_game_players < 2:
             self.state = game_state_id['showdown']
             return
 
